@@ -200,7 +200,7 @@
   'use strict';
 
   var API_URL = 'https://api.anthropic.com/v1/messages';
-  var MODEL = 'claude-opus-5';
+  var MODEL = 'claude-sonnet-5';
   var KEY_LS = 'db-api-key';
   var WS_LS = 'db-workspace-id';
   var RECENTS_LS = 'db-recents';
@@ -265,6 +265,9 @@
         if (!res.ok) {
           return res.json().catch(function () { return {}; }).then(function (j) {
             var msg = (j && j.error && j.error.message) || ('API error ' + res.status);
+            if (/credit balance/i.test(msg)) {
+              msg = 'Anthropic says the credit balance is too low. If you just added credits: they can take a few minutes to register — retry shortly. If it persists, check console.anthropic.com → Billing, and check whether the workspace has a monthly spend limit (Organization settings → Workspaces).';
+            }
             var err = new Error(msg);
             err.status = res.status;
             throw err;
@@ -476,7 +479,7 @@
     m.error = null;
     return callClaude({
       prompt: researchPrompt(m, state.band.officialName),
-      maxUses: 5,
+      maxUses: 3,
       effort: 'medium',
       maxTokens: 8000
     }).then(function (data) {

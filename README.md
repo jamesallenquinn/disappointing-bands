@@ -19,4 +19,4 @@ python -m http.server 4395 --directory C:\Users\james\Claude\disappointing-bands
 Host it anywhere static (GitHub Pages / Netlify), open in Safari, Share → Add to Home Screen. Runs full-screen with the broken-heart icon.
 
 ## Cost / model
-Uses `claude-opus-5` with the `web_search_20260209` server tool (up to 5 searches per member, 4 members researched in parallel). A fresh 5-member band runs roughly $0.50–$1.00; cached repeats are free. To cut cost ~60%, change `MODEL` in index.html to `claude-sonnet-5`.
+Uses `claude-sonnet-5` with the `web_search_20260209` server tool (up to 3 searches per member, 4 members researched in parallel). A fresh 5-member band runs roughly $0.25–$0.40; cached repeats are free. For maximum research quality at ~3× the cost, change `MODEL` in index.html to `claude-opus-5`.
