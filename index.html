@@ -67,14 +67,22 @@
   #status { color: var(--dim); font-size: 14px; margin: 14px 2px; min-height: 18px; }
   #status.error { color: var(--red); }
 
-  /* band header */
-  #bandHeader { margin: 6px 0 12px; }
-  #bandHeader .bandName { font-size: 20px; font-weight: 700; }
-  #bandHeader .verdict { font-size: 14px; margin-top: 3px; }
-  #bandHeader .verdict.good { color: var(--green); }
-  #bandHeader .verdict.bad { color: var(--red); }
-  #bandHeader .cacheNote { color: var(--dim); font-size: 12px; margin-top: 4px; }
-  #bandHeader .cacheNote a { color: var(--accent); cursor: pointer; text-decoration: underline; }
+  /* band sections (one per search, newest on top) */
+  .bandSec { margin: 6px 0 24px; }
+  .bandHead { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
+  .bandInfo { flex: 1; min-width: 0; }
+  .bandName { font-size: 20px; font-weight: 700; }
+  .verdict { font-size: 14px; margin-top: 3px; }
+  .verdict.good { color: var(--green); }
+  .verdict.bad { color: var(--red); }
+  .verdict.dim { color: var(--dim); }
+  .verdict.err { color: var(--red); }
+  .cacheNote { color: var(--dim); font-size: 12px; margin-top: 4px; }
+  .cacheNote a { color: var(--accent); cursor: pointer; text-decoration: underline; }
+  .dismissBtn {
+    flex: none; background: none; border: 1px solid var(--border); color: var(--dim);
+    border-radius: 8px; width: 30px; height: 30px; font-size: 18px; line-height: 1; cursor: pointer;
+  }
 
   /* member cards */
   .card {
@@ -91,6 +99,7 @@
   }
   .badge.pass { background: var(--green-bg); color: var(--green); border: 1px solid #1d5c38; }
   .badge.checking { background: #22222e; color: var(--dim); animation: pulse 1.2s ease-in-out infinite; }
+  .badge.queued { background: #22222e; color: var(--dim); border: 1px dashed var(--border); }
   .badge.err { background: #2b2230; color: var(--orange); border: 1px solid #4b3a25; }
   .badge.sev1 { background: #332b10; color: var(--yellow); border: 1px solid #5c4d1d; }
   .badge.sev2 { background: #33230f; color: var(--orange); border: 1px solid #5c401d; }
@@ -173,7 +182,6 @@
   <div id="recents"></div>
 
   <div id="status"></div>
-  <div id="bandHeader"></div>
   <div id="results"></div>
 
   <div id="overlay">
@@ -210,12 +218,14 @@
   var state = {
     key: localStorage.getItem(KEY_LS) || '',
     wsid: localStorage.getItem(WS_LS) || '',
-    generation: 0,
-    band: null // { query, officialName, kind, when, members: [{name, role, years, result, error}] }
+    // Newest first. Each job: { id, query, officialName, kind, status, error, when, members, fromCache, cancelled, started }
+    // status: 'lineup' | 'researching' | 'done' | 'error'
+    jobs: []
   };
+  var nextJobId = 1;
 
   var $ = function (id) { return document.getElementById(id); };
-  var elStatus = $('status'), elResults = $('results'), elBandHeader = $('bandHeader');
+  var elStatus = $('status'), elResults = $('results');
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -228,6 +238,28 @@
   }
   function hostOf(u) {
     try { return new URL(u).hostname.replace(/^www\./, ''); } catch (e) { return 'source'; }
+  }
+
+  /* ---------- shared task pool: everything runs through here, FIFO, CONCURRENCY lanes ---------- */
+
+  var pool = { queue: [], active: 0 };
+
+  function enqueue(fn) {
+    return new Promise(function (resolve, reject) {
+      pool.queue.push({ fn: fn, resolve: resolve, reject: reject });
+      pump();
+    });
+  }
+
+  function pump() {
+    while (pool.active < CONCURRENCY && pool.queue.length) {
+      var t = pool.queue.shift();
+      pool.active++;
+      Promise.resolve().then(t.fn).then(t.resolve, t.reject).then(function () {
+        pool.active--;
+        pump();
+      });
+    }
   }
 
   /* ---------- Anthropic API ---------- */
@@ -306,6 +338,16 @@
     return JSON.parse(text.slice(a, b + 1));
   }
 
+  function friendlyError(e) {
+    if (e.status === 401) { openPanel(); return 'API key rejected — check it in settings.'; }
+    if (/workspace.?id/i.test(e.message || '')) {
+      openPanel();
+      return 'This is a Personal (identity-linked) key — it also needs your Workspace ID. Find it in the Console under Organization settings → Workspaces, and paste it in settings.';
+    }
+    if (e.refusal) return 'Research declined: ' + e.message;
+    return 'Failed: ' + e.message;
+  }
+
   /* ---------- prompts ---------- */
 
   function membersPrompt(query) {
@@ -353,19 +395,23 @@
     return s;
   }
 
+  function isFlagged(m) {
+    return !!(m.result && m.result.status === 'flagged' && (m.result.items || []).length);
+  }
+
   function badgeFor(m) {
     if (m.error) return '<span class="badge err">ERROR · TAP</span>';
-    if (!m.result) return '<span class="badge checking">CHECKING…</span>';
-    if (m.result.status !== 'flagged' || !(m.result.items || []).length) return '<span class="badge pass">PASS</span>';
+    if (!m.result) return m.started ? '<span class="badge checking">CHECKING…</span>' : '<span class="badge queued">QUEUED</span>';
+    if (!isFlagged(m)) return '<span class="badge pass">PASS</span>';
     var sev = worstSev(m.result);
     return '<span class="badge sev' + sev + '">' + SEV_LABEL[sev] + '</span>';
   }
 
-  function renderCard(m, i) {
+  function renderCard(m, j, i) {
     var body = '';
     if (m.error) {
       body = '<div class="cleanNote">' + esc(m.error) + '</div>' +
-        '<button class="retryBtn" data-retry="' + i + '">Retry</button>';
+        '<button class="retryBtn" data-retry="' + j + ':' + i + '">Retry</button>';
     } else if (m.result) {
       var items = m.result.items || [];
       if (!items.length) {
@@ -388,9 +434,9 @@
         }).join('');
       }
     } else {
-      body = '<div class="cleanNote">Still researching…</div>';
+      body = '<div class="cleanNote">' + (m.started ? 'Still researching…' : 'Waiting for earlier searches to finish…') + '</div>';
     }
-    return '<div class="card' + (m.open ? ' open' : '') + '" data-i="' + i + '">' +
+    return '<div class="card' + (m.open ? ' open' : '') + '" data-j="' + j + '" data-i="' + i + '">' +
       '<div class="cardHead">' +
         '<div class="who"><div class="nm">' + esc(m.name) + '</div>' +
         '<div class="rl">' + esc(m.role || '') + (m.years ? ' · ' + esc(m.years) : '') + '</div></div>' +
@@ -400,34 +446,44 @@
     '</div>';
   }
 
+  function verdictFor(job) {
+    var n = job.members.length;
+    var who = job.kind === 'solo' ? '' : ' members';
+    if (job.status === 'error') return '<div class="verdict err">' + esc(job.error) + '</div>';
+    if (job.status === 'lineup') return '<div class="verdict dim">' + (job.started ? 'Finding the lineup…' : 'Queued — waiting for earlier searches…') + '</div>';
+    var done = job.members.filter(function (m) { return m.result || m.error; }).length;
+    var started = job.members.filter(function (m) { return m.started; }).length;
+    if (job.status === 'researching') {
+      if (!done && !started) return '<div class="verdict dim">Queued · ' + n + who + ' to check</div>';
+      return '<div class="verdict dim">Checking ' + n + who + '… (' + done + ' done)</div>';
+    }
+    var flagged = job.members.filter(isFlagged).length;
+    if (flagged === 0) return '<div class="verdict good">✅ All clear — no public scandals found</div>';
+    return '<div class="verdict bad">⚠️ ' + flagged + ' of ' + n + who + ' flagged</div>';
+  }
+
+  function renderJob(job, j) {
+    var cacheNote = job.fromCache
+      ? '<div class="cacheNote">Saved result from ' + esc(new Date(job.when).toLocaleDateString()) +
+        ' · <a data-refresh="' + j + '">Search again</a></div>'
+      : '';
+    var retry = job.status === 'error'
+      ? '<div class="cacheNote"><a data-refresh="' + j + '">Try again</a></div>'
+      : '';
+    return '<section class="bandSec" data-job="' + job.id + '">' +
+      '<div class="bandHead">' +
+        '<div class="bandInfo">' +
+          '<div class="bandName">' + esc(job.officialName) + '</div>' +
+          verdictFor(job) + cacheNote + retry +
+        '</div>' +
+        '<button class="dismissBtn" data-dismiss="' + j + '" title="Remove">&times;</button>' +
+      '</div>' +
+      job.members.map(function (m, i) { return renderCard(m, j, i); }).join('') +
+    '</section>';
+  }
+
   function renderAll() {
-    var band = state.band;
-    if (!band) { elBandHeader.innerHTML = ''; elResults.innerHTML = ''; return; }
-
-    var done = band.members.filter(function (m) { return m.result || m.error; }).length;
-    var flagged = band.members.filter(function (m) { return m.result && m.result.status === 'flagged' && (m.result.items || []).length; }).length;
-    var allDone = done === band.members.length;
-
-    var verdict;
-    if (!allDone) {
-      verdict = '<span class="verdict" style="color:var(--dim)">Checking ' + band.members.length + (band.kind === 'solo' ? ' artist' : ' members') + '… (' + done + ' done)</span>';
-    } else if (flagged === 0) {
-      verdict = '<span class="verdict good">✅ All clear — no public scandals found</span>';
-    } else {
-      verdict = '<span class="verdict bad">⚠️ ' + flagged + ' of ' + band.members.length + (band.kind === 'solo' ? '' : ' members') + ' flagged</span>';
-    }
-
-    var cacheNote = '';
-    if (band.fromCache) {
-      cacheNote = '<div class="cacheNote">Saved result from ' + esc(new Date(band.when).toLocaleDateString()) +
-        ' · <a id="refreshLink">Search again</a></div>';
-    }
-
-    elBandHeader.innerHTML = '<div class="bandName">' + esc(band.officialName) + '</div>' + verdict + cacheNote;
-    elResults.innerHTML = band.members.map(renderCard).join('');
-
-    var rl = $('refreshLink');
-    if (rl) rl.onclick = function () { runSearch(band.query, true); };
+    elResults.innerHTML = state.jobs.map(renderJob).join('');
   }
 
   function setStatus(msg, isErr) {
@@ -439,13 +495,11 @@
 
   function cacheKey(q) { return CACHE_PREFIX + q.trim().toLowerCase(); }
 
-  function saveCache() {
-    var b = state.band;
-    if (!b) return;
+  function saveCache(job) {
     try {
-      localStorage.setItem(cacheKey(b.query), JSON.stringify({
-        query: b.query, officialName: b.officialName, kind: b.kind, when: b.when,
-        members: b.members.map(function (m) {
+      localStorage.setItem(cacheKey(job.query), JSON.stringify({
+        query: job.query, officialName: job.officialName, kind: job.kind, when: job.when,
+        members: job.members.map(function (m) {
           return { name: m.name, role: m.role, years: m.years, result: m.result || null };
         })
       }));
@@ -455,7 +509,9 @@
   function loadCache(q) {
     try {
       var raw = localStorage.getItem(cacheKey(q));
-      return raw ? JSON.parse(raw) : null;
+      var c = raw ? JSON.parse(raw) : null;
+      if (c && c.members && c.members.length && c.members.every(function (m) { return m.result; })) return c;
+      return null;
     } catch (e) { return null; }
   }
 
@@ -475,114 +531,125 @@
     }).join('');
   }
 
-  /* ---------- search flow ---------- */
+  /* ---------- jobs ---------- */
 
-  function researchMember(m, gen) {
+  function findJob(query) {
+    var norm = query.trim().toLowerCase();
+    for (var i = 0; i < state.jobs.length; i++) {
+      if (state.jobs[i].query.trim().toLowerCase() === norm) return state.jobs[i];
+    }
+    return null;
+  }
+
+  function removeJob(job) {
+    job.cancelled = true;
+    state.jobs = state.jobs.filter(function (j) { return j !== job; });
+    renderAll();
+  }
+
+  function jobDone(job) {
+    return job.members.every(function (m) { return m.result || m.error; });
+  }
+
+  function researchMember(job, m) {
     m.result = null;
     m.error = null;
-    return callClaude({
-      prompt: researchPrompt(m, state.band.officialName),
-      maxUses: 3,
-      effort: 'medium',
-      maxTokens: 8000
-    }).then(function (data) {
-      if (gen !== state.generation) return;
-      try {
-        var r = parseJson(textOf(data));
-        m.result = { status: r.status === 'flagged' ? 'flagged' : 'clear', items: Array.isArray(r.items) ? r.items : [] };
-        if (m.result.items.length) m.open = false;
-      } catch (e) {
-        m.error = 'Could not read the research result. Tap retry.';
-      }
-    }).catch(function (e) {
-      if (gen !== state.generation) return;
-      m.error = e.refusal ? ('Research declined: ' + e.message) : ('Failed: ' + e.message);
-    }).then(function () {
-      if (gen !== state.generation) return;
+    m.started = false;
+    renderAll();
+    return enqueue(function () {
+      if (job.cancelled) return;
+      m.started = true;
       renderAll();
-      saveCache();
+      return callClaude({
+        prompt: researchPrompt(m, job.officialName),
+        maxUses: 3,
+        effort: 'medium',
+        maxTokens: 8000
+      }).then(function (data) {
+        if (job.cancelled) return;
+        try {
+          var r = parseJson(textOf(data));
+          m.result = { status: r.status === 'flagged' ? 'flagged' : 'clear', items: Array.isArray(r.items) ? r.items : [] };
+        } catch (e) {
+          m.error = 'Could not read the research result. Tap retry.';
+        }
+      }).catch(function (e) {
+        if (job.cancelled) return;
+        m.error = friendlyError(e);
+      }).then(function () {
+        if (job.cancelled) return;
+        if (jobDone(job)) job.status = 'done';
+        renderAll();
+        saveCache(job);
+      });
     });
   }
 
-  function runPool(tasks, limit) {
-    var i = 0;
-    function next() {
-      if (i >= tasks.length) return Promise.resolve();
-      var t = tasks[i++];
-      return t().then(next);
-    }
-    var lanes = [];
-    for (var k = 0; k < Math.min(limit, tasks.length); k++) lanes.push(next());
-    return Promise.all(lanes);
-  }
-
-  function runSearch(query, force) {
+  function startJob(query, force) {
     query = (query || '').trim();
     if (!query) return;
     if (!state.key) { openPanel(); return; }
 
-    var gen = ++state.generation;
-    $('q').value = query;
-    $('q').blur();
     pushRecent(query);
+    var existing = findJob(query);
+    if (existing && !force) {
+      // Already on screen — just bring it to the top.
+      state.jobs = [existing].concat(state.jobs.filter(function (j) { return j !== existing; }));
+      renderAll();
+      return;
+    }
+    if (existing) removeJob(existing);
 
     if (!force) {
       var cached = loadCache(query);
-      if (cached && cached.members && cached.members.every(function (m) { return m.result; })) {
-        state.band = cached;
-        state.band.fromCache = true;
-        setStatus('');
+      if (cached) {
+        cached.id = nextJobId++;
+        cached.status = 'done';
+        cached.fromCache = true;
+        cached.members.forEach(function (m) { m.started = true; m.open = false; });
+        state.jobs.unshift(cached);
         renderAll();
         return;
       }
     }
 
-    state.band = null;
+    var job = {
+      id: nextJobId++, query: query, officialName: query, kind: 'band',
+      status: 'lineup', error: null, when: Date.now(), members: [],
+      fromCache: false, cancelled: false, started: false
+    };
+    state.jobs.unshift(job);
+    setStatus('');
     renderAll();
-    setStatus('Finding the lineup…');
-    $('searchBtn').disabled = true;
 
-    callClaude({ prompt: membersPrompt(query), maxUses: 2, effort: 'low', maxTokens: 4000 })
-      .then(function (data) {
-        if (gen !== state.generation) return;
-        var info = parseJson(textOf(data));
-        if (!info.found || !Array.isArray(info.members) || !info.members.length) {
-          setStatus('Couldn’t find a band or artist called “' + query + '”.', true);
-          return;
-        }
-        state.band = {
-          query: query,
-          officialName: info.officialName || query,
-          kind: info.kind || 'band',
-          when: Date.now(),
-          members: info.members.map(function (m) {
-            return { name: m.name, role: m.role || '', years: m.years || '', result: null, error: null, open: false };
-          })
-        };
-        setStatus('');
-        renderAll();
-        var tasks = state.band.members.map(function (m) {
-          return function () { return researchMember(m, gen); };
-        });
-        return runPool(tasks, CONCURRENCY);
-      })
-      .catch(function (e) {
-        if (gen !== state.generation) return;
-        if (e.status === 401) {
-          setStatus('API key rejected — check it in settings.', true);
-          openPanel();
-        } else if (/workspace.?id/i.test(e.message || '')) {
-          setStatus('This is a Personal (identity-linked) key — it also needs your Workspace ID. Find it in the Console under Organization settings → Workspaces, and paste it below.', true);
-          openPanel();
-        } else if (e.refusal) {
-          setStatus('Search declined: ' + e.message, true);
-        } else {
-          setStatus('Search failed: ' + e.message, true);
-        }
-      })
-      .then(function () {
-        if (gen === state.generation) $('searchBtn').disabled = false;
-      });
+    enqueue(function () {
+      if (job.cancelled) return;
+      job.started = true;
+      renderAll();
+      return callClaude({ prompt: membersPrompt(query), maxUses: 2, effort: 'low', maxTokens: 4000 })
+        .then(function (data) {
+          if (job.cancelled) return;
+          var info = parseJson(textOf(data));
+          if (!info.found || !Array.isArray(info.members) || !info.members.length) {
+            job.status = 'error';
+            job.error = 'Couldn’t find a band or artist called “' + query + '”.';
+            return;
+          }
+          job.officialName = info.officialName || query;
+          job.kind = info.kind || 'band';
+          job.status = 'researching';
+          job.members = info.members.map(function (m) {
+            return { name: m.name, role: m.role || '', years: m.years || '', result: null, error: null, open: false, started: false };
+          });
+          job.members.forEach(function (m) { researchMember(job, m); });
+        })
+        .catch(function (e) {
+          if (job.cancelled) return;
+          job.status = 'error';
+          job.error = friendlyError(e);
+        })
+        .then(renderAll);
+    });
   }
 
   /* ---------- settings panel ---------- */
@@ -598,26 +665,38 @@
 
   $('searchForm').addEventListener('submit', function (e) {
     e.preventDefault();
-    runSearch($('q').value, false);
+    var q = $('q').value;
+    $('q').value = '';
+    startJob(q, false);
   });
 
   $('recents').addEventListener('click', function (e) {
     var q = e.target.getAttribute && e.target.getAttribute('data-q');
-    if (q) runSearch(q, false);
+    if (q) startJob(q, false);
   });
 
   elResults.addEventListener('click', function (e) {
-    var retry = e.target.getAttribute && e.target.getAttribute('data-retry');
+    var t = e.target;
+    var attr = function (name) { return t.getAttribute && t.getAttribute(name); };
+
+    var dismiss = attr('data-dismiss');
+    if (dismiss != null) { removeJob(state.jobs[+dismiss]); return; }
+
+    var refresh = attr('data-refresh');
+    if (refresh != null) { startJob(state.jobs[+refresh].query, true); return; }
+
+    var retry = attr('data-retry');
     if (retry != null) {
-      var m = state.band.members[+retry];
-      renderAll();
-      researchMember(m, state.generation);
+      var p = retry.split(':');
+      var job = state.jobs[+p[0]];
+      researchMember(job, job.members[+p[1]]);
       return;
     }
-    if (e.target.closest('a')) return;
-    var card = e.target.closest('.card');
+
+    if (t.closest('a')) return;
+    var card = t.closest('.card');
     if (!card) return;
-    var mm = state.band.members[+card.getAttribute('data-i')];
+    var mm = state.jobs[+card.getAttribute('data-j')].members[+card.getAttribute('data-i')];
     mm.open = !mm.open;
     renderAll();
   });
