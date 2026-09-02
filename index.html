@@ -242,7 +242,6 @@
       var body = {
         model: MODEL,
         max_tokens: opts.maxTokens || 8000,
-        fallbacks: 'default',
         tools: [{ type: 'web_search_20260209', name: 'web_search', max_uses: opts.maxUses || 3 }],
         messages: messages
       };
@@ -252,10 +251,14 @@
         'content-type': 'application/json',
         'x-api-key': state.key,
         'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true',
-        'anthropic-beta': 'server-side-fallback-2026-07-01'
+        'anthropic-dangerous-direct-browser-access': 'true'
       };
       if (state.wsid) headers['anthropic-workspace-id'] = state.wsid;
+      // Server-side refusal fallbacks exist only on Opus 5 / Fable 5; other models reject the parameter.
+      if (/^claude-(opus-5|fable)/.test(MODEL)) {
+        body.fallbacks = 'default';
+        headers['anthropic-beta'] = 'server-side-fallback-2026-07-01';
+      }
 
       return fetch(API_URL, {
         method: 'POST',
