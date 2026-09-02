@@ -19,4 +19,5 @@ python -m http.server 4395 --directory C:\Users\james\Claude\disappointing-bands
 Host it anywhere static (GitHub Pages / Netlify), open in Safari, Share → Add to Home Screen. Runs full-screen with the broken-heart icon.
 
 ## Cost / model
-Uses `claude-sonnet-5` with the `web_search_20260209` server tool (up to 3 searches per member, 4 members researched in parallel). A fresh 5-member band runs roughly $0.25–$0.40; cached repeats are free. For maximum research quality at ~3× the cost, change `MODEL` in index.html to `claude-opus-5`.
+Lineup lookup runs on `claude-sonnet-5` (cheap, fast). Member research runs on `claude-opus-5` with the `web_search_20260209` server tool — up to 5 searches per member, with three mandatory queries (allegations / arrested-charged-lawsuit / grooming-underage) baked into the prompt and the queries echoed back so a PASS shows what was searched. 4 members researched in parallel. A fresh 5-member band runs roughly $0.60–0.90; a 12-member roster ~$1.80; cached repeats are free.
+To trade reliability for cost, change `RESEARCH_MODEL` in index.html to `claude-sonnet-5` (~half the price; it missed a widely-reported 2022 allegation in testing, which is why research went back to Opus).

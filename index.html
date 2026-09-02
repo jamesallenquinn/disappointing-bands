@@ -130,6 +130,7 @@
     background: var(--panel2); border-radius: 6px; padding: 3px 8px;
   }
   .cleanNote { color: var(--dim); font-size: 13px; padding: 10px 0; }
+  .searched { color: #6a6a80; font-size: 11.5px; line-height: 1.5; padding: 0 0 8px; }
   .retryBtn {
     background: var(--panel2); border: 1px solid var(--border); color: var(--text);
     border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; margin: 10px 0 4px;
@@ -208,11 +209,13 @@
   'use strict';
 
   var API_URL = 'https://api.anthropic.com/v1/messages';
-  var MODEL = 'claude-sonnet-5';
+  var LINEUP_MODEL = 'claude-sonnet-5';    // cheap + fast; lineups are easy
+  var RESEARCH_MODEL = 'claude-opus-5';    // thorough searcher; this is where reliability lives
   var KEY_LS = 'db-api-key';
   var WS_LS = 'db-workspace-id';
   var RECENTS_LS = 'db-recents';
   var CACHE_PREFIX = 'db-band:';
+  var CACHE_VERSION = 2;   // bump when research quality changes so stale verdicts are re-run
   var CONCURRENCY = 4;
 
   var state = {
@@ -265,14 +268,15 @@
   /* ---------- Anthropic API ---------- */
 
   function callClaude(opts) {
-    // opts: { prompt, maxUses, effort, maxTokens }
+    // opts: { prompt, model, maxUses, effort, maxTokens }
+    var model = opts.model || RESEARCH_MODEL;
     var messages = [{ role: 'user', content: opts.prompt }];
     var round = 0;
 
     function go() {
       round++;
       var body = {
-        model: MODEL,
+        model: model,
         max_tokens: opts.maxTokens || 8000,
         tools: [{ type: 'web_search_20260209', name: 'web_search', max_uses: opts.maxUses || 3 }],
         messages: messages
@@ -287,7 +291,7 @@
       };
       if (state.wsid) headers['anthropic-workspace-id'] = state.wsid;
       // Server-side refusal fallbacks exist only on Opus 5 / Fable 5; other models reject the parameter.
-      if (/^claude-(opus-5|fable)/.test(MODEL)) {
+      if (/^claude-(opus-5|fable)/.test(model)) {
         body.fallbacks = 'default';
         headers['anthropic-beta'] = 'server-side-fallback-2026-07-01';
       }
@@ -360,22 +364,28 @@
   }
 
   function researchPrompt(member, bandName) {
-    return 'Research the public record of ' + member.name + ' (' + (member.role || 'member') + ' of ' + bandName + ').\n\n' +
-      'Search the web for reporting on, in priority order:\n' +
+    var n = member.name, b = bandName;
+    return 'Research the public record of ' + n + ' (' + (member.role || 'member') + ' of ' + b + ').\n\n' +
+      'You MUST run web searches before answering — never answer from memory alone, and never answer "clear" without having searched. Run at least these three searches (adapt the wording if needed), then follow up on anything relevant:\n' +
+      '1. "' + n + '" allegations OR accused OR misconduct\n' +
+      '2. "' + n + '" ' + b + ' arrested OR charged OR lawsuit OR convicted\n' +
+      '3. "' + n + '" grooming OR underage OR minor OR "sexual misconduct"\n\n' +
+      'You are looking for, in priority order:\n' +
       '1. HIGHEST PRIORITY: sexual misconduct of any kind involving minors — convictions, charges, lawsuits, or public allegations (grooming, sexual messages with underage fans, statutory offenses, CSAM, relationships with underage girls or boys, etc.).\n' +
-      '2. Other sexual misconduct: assault, harassment, or abuse allegations involving adults.\n' +
+      '2. Other sexual misconduct: assault, harassment, abuse, or predatory behavior toward fans or adults.\n' +
       '3. Other serious legal issues: violent crime, domestic violence, DUI causing harm, fraud, serious drug convictions.\n' +
       '4. Major public scandals that seriously damaged their reputation (abuse allegations, racism incidents, etc.).\n\n' +
       'Rules:\n' +
-      '- Only include things actually reported by identifiable news sources. Never speculate, infer, or fill gaps.\n' +
-      '- Be precise about legal status: convicted, charged, civil lawsuit, publicly alleged, or unverified rumor. Note outcomes (acquitted, dropped, settled) in the summary.\n' +
+      '- Include only things actually reported by identifiable sources: news outlets, music press (Alternative Press, Brooklyn Vegan, Pitchfork, Stereogum, Kerrang, NME, etc.), court records, or the person’s own public statements or apologies. Never speculate or fill gaps.\n' +
+      '- Public allegations by named or multiple accusers that were covered by the press DO count — report them at the "alleged" level, and mention if the person responded, apologized, or denied.\n' +
+      '- Be precise about legal status: convicted, charged, civil-suit, alleged, or rumor. Note outcomes (acquitted, dropped, settled, apology issued) in the summary.\n' +
       '- Do not attribute reporting about a different person with a similar name to this person.\n' +
       '- Ordinary drug use, rehab, band drama, feuds, and divorces do NOT count unless they involved crimes or serious allegations.\n' +
-      '- Finding nothing is a normal, valid result.\n\n' +
-      'Respond with ONLY a JSON object, no other text:\n' +
-      '{"status":"clear","items":[]}\n' +
+      '- Return "clear" only after your searches turned up nothing relevant.\n\n' +
+      'Respond with ONLY a JSON object, no other text. Always include the "searches" array listing the exact queries you ran:\n' +
+      '{"status":"clear","searches":["query 1","query 2","query 3"],"items":[]}\n' +
       'or\n' +
-      '{"status":"flagged","items":[{"title":"Short headline","category":"sexual-misconduct-minor","level":"convicted","year":"2013","summary":"2-3 factual sentences including the outcome.","sources":["https://..."]}]}\n' +
+      '{"status":"flagged","searches":["query 1","query 2","query 3"],"items":[{"title":"Short headline","category":"sexual-misconduct-minor","level":"alleged","year":"2022","summary":"2-3 factual sentences including the outcome or response.","sources":["https://..."]}]}\n' +
       'category must be one of: "sexual-misconduct-minor", "sexual-misconduct", "violence", "other-crime", "scandal".\n' +
       'level must be one of: "convicted", "charged", "civil-suit", "alleged", "rumor".';
   }
@@ -407,6 +417,12 @@
     return '<span class="badge sev' + sev + '">' + SEV_LABEL[sev] + '</span>';
   }
 
+  function searchedLine(m) {
+    var qs = (m.result && m.result.searches) || [];
+    if (!qs.length) return '';
+    return '<div class="searched">Searched: ' + qs.map(function (q) { return '“' + esc(q) + '”'; }).join(' · ') + '</div>';
+  }
+
   function renderCard(m, j, i) {
     var body = '';
     if (m.error) {
@@ -415,7 +431,7 @@
     } else if (m.result) {
       var items = m.result.items || [];
       if (!items.length) {
-        body = '<div class="cleanNote">No publicly reported allegations, convictions, or major scandals found.</div>';
+        body = '<div class="cleanNote">No publicly reported allegations, convictions, or major scandals found.</div>' + searchedLine(m);
       } else {
         body = items.map(function (it) {
           var lvl = LVL_LABEL[it.level] ? it.level : 'alleged';
@@ -431,7 +447,7 @@
             '<div class="itemSummary">' + esc(it.summary || '') + '</div>' +
             (srcs ? '<div class="itemSources">' + srcs + '</div>' : '') +
           '</div>';
-        }).join('');
+        }).join('') + searchedLine(m);
       }
     } else {
       body = '<div class="cleanNote">' + (m.started ? 'Still researching…' : 'Waiting for earlier searches to finish…') + '</div>';
@@ -498,6 +514,7 @@
   function saveCache(job) {
     try {
       localStorage.setItem(cacheKey(job.query), JSON.stringify({
+        v: CACHE_VERSION,
         query: job.query, officialName: job.officialName, kind: job.kind, when: job.when,
         members: job.members.map(function (m) {
           return { name: m.name, role: m.role, years: m.years, result: m.result || null };
@@ -510,7 +527,7 @@
     try {
       var raw = localStorage.getItem(cacheKey(q));
       var c = raw ? JSON.parse(raw) : null;
-      if (c && c.members && c.members.length && c.members.every(function (m) { return m.result; })) return c;
+      if (c && c.v === CACHE_VERSION && c.members && c.members.length && c.members.every(function (m) { return m.result; })) return c;
       return null;
     } catch (e) { return null; }
   }
@@ -562,14 +579,19 @@
       renderAll();
       return callClaude({
         prompt: researchPrompt(m, job.officialName),
-        maxUses: 3,
+        model: RESEARCH_MODEL,
+        maxUses: 5,
         effort: 'medium',
         maxTokens: 8000
       }).then(function (data) {
         if (job.cancelled) return;
         try {
           var r = parseJson(textOf(data));
-          m.result = { status: r.status === 'flagged' ? 'flagged' : 'clear', items: Array.isArray(r.items) ? r.items : [] };
+          m.result = {
+            status: r.status === 'flagged' ? 'flagged' : 'clear',
+            items: Array.isArray(r.items) ? r.items : [],
+            searches: Array.isArray(r.searches) ? r.searches.filter(function (q) { return typeof q === 'string'; }) : []
+          };
         } catch (e) {
           m.error = 'Could not read the research result. Tap retry.';
         }
@@ -626,7 +648,7 @@
       if (job.cancelled) return;
       job.started = true;
       renderAll();
-      return callClaude({ prompt: membersPrompt(query), maxUses: 2, effort: 'low', maxTokens: 4000 })
+      return callClaude({ prompt: membersPrompt(query), model: LINEUP_MODEL, maxUses: 2, effort: 'low', maxTokens: 4000 })
         .then(function (data) {
           if (job.cancelled) return;
           var info = parseJson(textOf(data));
